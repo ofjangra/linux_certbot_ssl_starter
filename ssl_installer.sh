@@ -6,6 +6,9 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Get script directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
 # Function to print colored messages
 print_message() {
     local color=$1
@@ -33,6 +36,33 @@ detect_package_manager() {
         print_message "$RED" "Unsupported package manager."
         exit 1
     fi
+}
+
+# Function to check if service is installed and running
+check_service_status() {
+    local service_name=$1
+    
+    # Check if service exists
+    if ! command -v $service_name &>/dev/null; then
+        print_message "$RED" "$service_name is not installed."
+        return 1
+    fi
+    
+    # Check if service is running
+    if ! systemctl is-active --quiet $service_name; then
+        print_message "$RED" "$service_name is not running."
+        print_message "$YELLOW" "Attempting to start $service_name..."
+        sudo systemctl start $service_name
+        
+        # Check again after attempting to start
+        if ! systemctl is-active --quiet $service_name; then
+            print_message "$RED" "Failed to start $service_name. Please check system logs."
+            return 1
+        fi
+    fi
+    
+    print_message "$GREEN" "$service_name is running properly."
+    return 0
 }
 
 # Function to update system packages
@@ -71,6 +101,12 @@ install_web_server() {
             sudo pacman -S --noconfirm $web_server
             ;;
     esac
+    
+    # Check if installation was successful and service is running
+    if ! check_service_status $web_server; then
+        print_message "$RED" "Failed to install or start $web_server. Exiting."
+        exit 1
+    fi
 }
 
 # Function to install Certbot
@@ -99,15 +135,29 @@ create_nginx_config() {
     local domain=$2
     local port=$3
     
+    # Create sites-available directory if it doesn't exist
+    sudo mkdir -p /etc/nginx/sites-available
+    
     local config_file="/etc/nginx/sites-available/$app_name"
-    local template_file="/home/kapiljangra/sslInstaller/templates/nginx/site-template.conf"
+    local template_file="$SCRIPT_DIR/templates/nginx/site-template.conf"
+    
+    # Check if template exists
+    if [ ! -f "$template_file" ]; then
+        print_message "$RED" "Template file not found at: $template_file"
+        exit 1
+    fi
     
     # Copy and modify template
-    cp "$template_file" "$config_file"
-    sed -i "s/{{DOMAIN}}/$domain/g" "$config_file"
-    sed -i "s/{{PORT}}/$port/g" "$config_file"
+    sudo cp "$template_file" "$config_file"
+    sudo sed -i "s/{{DOMAIN}}/$domain/g" "$config_file"
+    sudo sed -i "s/{{PORT}}/$port/g" "$config_file"
     
-    sudo ln -sf $config_file /etc/nginx/sites-enabled/
+    # Test nginx configuration
+    print_message "$YELLOW" "Testing Nginx configuration..."
+    if ! sudo nginx -t; then
+        print_message "$RED" "Nginx configuration test failed. Please check the configuration."
+        exit 1
+    fi
 }
 
 # Function to create Apache configuration
@@ -117,12 +167,18 @@ create_apache_config() {
     local port=$3
     
     local config_file="/etc/apache2/sites-available/$app_name.conf"
-    local template_file="/home/kapiljangra/sslInstaller/templates/apache/site-template.conf"
+    local template_file="$SCRIPT_DIR/templates/apache/site-template.conf"
+    
+    # Check if template exists
+    if [ ! -f "$template_file" ]; then
+        print_message "$RED" "Template file not found at: $template_file"
+        exit 1
+    fi
     
     # Copy and modify template
-    cp "$template_file" "$config_file"
-    sed -i "s/{{DOMAIN}}/$domain/g" "$config_file"
-    sed -i "s/{{PORT}}/$port/g" "$config_file"
+    sudo cp "$template_file" "$config_file"
+    sudo sed -i "s/{{DOMAIN}}/$domain/g" "$config_file"
+    sudo sed -i "s/{{PORT}}/$port/g" "$config_file"
     
     sudo a2ensite "$app_name"
 }
@@ -185,6 +241,12 @@ update_system "$pkg_manager"
 # Install web server if not present
 if ! command -v $web_server &>/dev/null; then
     install_web_server "$pkg_manager" "$web_server"
+else
+    # Check if existing web server is running properly
+    if ! check_service_status $web_server; then
+        print_message "$RED" "Existing $web_server installation is not working properly. Attempting to fix..."
+        install_web_server "$pkg_manager" "$web_server"
+    fi
 fi
 
 # Install Certbot
@@ -213,12 +275,22 @@ for ((i=1; i<=num_apps; i++)); do
 done
 
 # Reload web server
-sudo systemctl reload $web_server
+print_message "$YELLOW" "Reloading $web_server..."
+if ! sudo systemctl reload $web_server; then
+    print_message "$RED" "Failed to reload $web_server. Attempting to restart..."
+    if ! sudo systemctl restart $web_server; then
+        print_message "$RED" "Failed to restart $web_server. Please check the configuration and try again."
+        exit 1
+    fi
+fi
 
 # Install SSL certificates
 for domain in "${domains[@]}"; do
     print_message "$YELLOW" "Installing SSL certificate for $domain"
-    sudo certbot --"$web_server" -d "$domain" --non-interactive --agree-tos --email "admin@${domain}" --redirect
+    if ! sudo certbot --"$web_server" -d "$domain" --non-interactive --agree-tos --email "admin@${domain}" --redirect; then
+        print_message "$RED" "Failed to install SSL certificate for $domain"
+        exit 1
+    fi
 done
 
 # Setup automatic renewal
