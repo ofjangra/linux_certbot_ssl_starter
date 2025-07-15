@@ -1,13 +1,13 @@
 #!/bin/bash
 
+# Get the directory where the script is located
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
-
-# Get script directory
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # Function to print colored messages
 print_message() {
@@ -36,33 +36,6 @@ detect_package_manager() {
         print_message "$RED" "Unsupported package manager."
         exit 1
     fi
-}
-
-# Function to check if service is installed and running
-check_service_status() {
-    local service_name=$1
-    
-    # Check if service exists
-    if ! command -v $service_name &>/dev/null; then
-        print_message "$RED" "$service_name is not installed."
-        return 1
-    fi
-    
-    # Check if service is running
-    if ! systemctl is-active --quiet $service_name; then
-        print_message "$RED" "$service_name is not running."
-        print_message "$YELLOW" "Attempting to start $service_name..."
-        sudo systemctl start $service_name
-        
-        # Check again after attempting to start
-        if ! systemctl is-active --quiet $service_name; then
-            print_message "$RED" "Failed to start $service_name. Please check system logs."
-            return 1
-        fi
-    fi
-    
-    print_message "$GREEN" "$service_name is running properly."
-    return 0
 }
 
 # Function to update system packages
@@ -101,12 +74,6 @@ install_web_server() {
             sudo pacman -S --noconfirm $web_server
             ;;
     esac
-    
-    # Check if installation was successful and service is running
-    if ! check_service_status $web_server; then
-        print_message "$RED" "Failed to install or start $web_server. Exiting."
-        exit 1
-    fi
 }
 
 # Function to install Certbot
@@ -135,29 +102,28 @@ create_nginx_config() {
     local domain=$2
     local port=$3
     
-    # Create sites-available directory if it doesn't exist
-    sudo mkdir -p /etc/nginx/sites-available
+    local config_file="/etc/nginx/nginx.conf"
+    local template_file="${SCRIPT_DIR}/templates/nginx/site-template.conf"
     
-    local config_file="/etc/nginx/sites-available/$app_name"
-    local template_file="$SCRIPT_DIR/templates/nginx/site-template.conf"
+    # Get template content
+    local template_content=$(cat "$template_file")
     
-    # Check if template exists
-    if [ ! -f "$template_file" ]; then
-        print_message "$RED" "Template file not found at: $template_file"
-        exit 1
+    # Replace placeholders
+    local server_block=$(echo "$template_content" | sed "s/{{DOMAIN}}/$domain/g" | sed "s/{{PORT}}/$port/g")
+    
+    # Check if there's an existing server block for this domain
+    if grep -q "server_name $domain;" "$config_file"; then
+        print_message "$YELLOW" "Configuration for $domain already exists in nginx.conf"
+        return
     fi
     
-    # Copy and modify template
-    sudo cp "$template_file" "$config_file"
-    sudo sed -i "s/{{DOMAIN}}/$domain/g" "$config_file"
-    sudo sed -i "s/{{PORT}}/$port/g" "$config_file"
+    # Backup the original configuration
+    sudo cp "$config_file" "${config_file}.backup.$(date +%Y%m%d%H%M%S)"
     
-    # Test nginx configuration
-    print_message "$YELLOW" "Testing Nginx configuration..."
-    if ! sudo nginx -t; then
-        print_message "$RED" "Nginx configuration test failed. Please check the configuration."
-        exit 1
-    fi
+    # Add the server block before the last closing brace in http section
+    sudo sed -i "/http {/,\$s/.*}/server {\n    listen 80;\n    listen [::]:80;\n    server_name $domain;\n\n    location \/ {\n        proxy_pass http:\/\/localhost:$port;\n        proxy_set_header Host \$host;\n        proxy_set_header X-Real-IP \$remote_addr;\n        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto \$scheme;\n    }\n}\n}/1" "$config_file"
+    
+    print_message "$GREEN" "Added configuration for $domain to nginx.conf"
 }
 
 # Function to create Apache configuration
@@ -166,21 +132,25 @@ create_apache_config() {
     local domain=$2
     local port=$3
     
-    local config_file="/etc/apache2/sites-available/$app_name.conf"
-    local template_file="$SCRIPT_DIR/templates/apache/site-template.conf"
+    local config_file="/etc/apache2/sites-available/000-default.conf"
+    local template_file="${SCRIPT_DIR}/templates/apache/site-template.conf"
     
-    # Check if template exists
-    if [ ! -f "$template_file" ]; then
-        print_message "$RED" "Template file not found at: $template_file"
-        exit 1
+    # Get template content and replace placeholders
+    local virtual_host=$(cat "$template_file" | sed "s/{{DOMAIN}}/$domain/g" | sed "s/{{PORT}}/$port/g")
+    
+    # Check if there's an existing VirtualHost for this domain
+    if grep -q "ServerName $domain" "$config_file"; then
+        print_message "$YELLOW" "Configuration for $domain already exists in default Apache config"
+        return
     fi
     
-    # Copy and modify template
-    sudo cp "$template_file" "$config_file"
-    sudo sed -i "s/{{DOMAIN}}/$domain/g" "$config_file"
-    sudo sed -i "s/{{PORT}}/$port/g" "$config_file"
+    # Backup the original configuration
+    sudo cp "$config_file" "${config_file}.backup.$(date +%Y%m%d%H%M%S)"
     
-    sudo a2ensite "$app_name"
+    # Append the VirtualHost block to the default config
+    echo "$virtual_host" | sudo tee -a "$config_file" > /dev/null
+    
+    print_message "$GREEN" "Added configuration for $domain to default Apache config"
 }
 
 # Function to setup SSL renewal
@@ -212,6 +182,22 @@ EOF
 # Main script starts here
 check_os
 
+# Check for template files
+if [[ ! -d "${SCRIPT_DIR}/templates" ]]; then
+    print_message "$RED" "Templates directory not found at ${SCRIPT_DIR}/templates"
+    exit 1
+fi
+
+if [[ ! -f "${SCRIPT_DIR}/templates/nginx/site-template.conf" ]]; then
+    print_message "$RED" "Nginx template file not found at ${SCRIPT_DIR}/templates/nginx/site-template.conf"
+    exit 1
+fi
+
+if [[ ! -f "${SCRIPT_DIR}/templates/apache/site-template.conf" ]]; then
+    print_message "$RED" "Apache template file not found at ${SCRIPT_DIR}/templates/apache/site-template.conf"
+    exit 1
+fi
+
 # Web server selection
 while true; do
     print_message "$GREEN" "Select your web server:"
@@ -241,12 +227,6 @@ update_system "$pkg_manager"
 # Install web server if not present
 if ! command -v $web_server &>/dev/null; then
     install_web_server "$pkg_manager" "$web_server"
-else
-    # Check if existing web server is running properly
-    if ! check_service_status $web_server; then
-        print_message "$RED" "Existing $web_server installation is not working properly. Attempting to fix..."
-        install_web_server "$pkg_manager" "$web_server"
-    fi
 fi
 
 # Install Certbot
@@ -275,22 +255,12 @@ for ((i=1; i<=num_apps; i++)); do
 done
 
 # Reload web server
-print_message "$YELLOW" "Reloading $web_server..."
-if ! sudo systemctl reload $web_server; then
-    print_message "$RED" "Failed to reload $web_server. Attempting to restart..."
-    if ! sudo systemctl restart $web_server; then
-        print_message "$RED" "Failed to restart $web_server. Please check the configuration and try again."
-        exit 1
-    fi
-fi
+sudo systemctl reload $web_server
 
 # Install SSL certificates
 for domain in "${domains[@]}"; do
     print_message "$YELLOW" "Installing SSL certificate for $domain"
-    if ! sudo certbot --"$web_server" -d "$domain" --non-interactive --agree-tos --email "admin@${domain}" --redirect; then
-        print_message "$RED" "Failed to install SSL certificate for $domain"
-        exit 1
-    fi
+    sudo certbot --"$web_server" -d "$domain" --non-interactive --agree-tos --email "admin@${domain}" --redirect
 done
 
 # Setup automatic renewal
